@@ -13,6 +13,9 @@ using namespace std;
 
 #include <WS2tcpip.h>
 #include <MSWSock.h>
+
+#include <immintrin.h>
+
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
@@ -25,7 +28,7 @@ constexpr auto MAX_THREAD = 4;
 constexpr auto MAX_BUFFER = 128;
 constexpr auto VIEW_RANGE = 7;
 
-constexpr auto MAX_USER = 10000;
+constexpr auto MAX_USER = 15000;
 
 constexpr int NUMPIECE = 2048;
 constexpr size_t BUFPIECESIZE = 128;
@@ -113,6 +116,7 @@ struct SOCKETINFO
 	BufferManager RioBufferMng;
 
 	atomic_int storedmsgcnt = 0;
+	chrono::steady_clock::time_point last_msg_time;
 };
 
 // buffer 시작 주소
@@ -182,6 +186,7 @@ public:
 //Rio_Memory_Manager* g_rio_mm;
 
 // 하나의 CQ로 모두 처리
+RIO_RQ thread_rio_rq[MAX_THREAD];
 RIO_CQ g_rio_cq[MAX_THREAD];
 mutex g_rio_cq_lock;
 
@@ -330,7 +335,8 @@ void send_packet_deffer(int id, void* buff)
 	{
 		printf_s("[DEBUG] RIOSend error: %d\n", GetLastError());
 	}
-	client->storedmsgcnt++;
+	//client->storedmsgcnt++;
+	client->last_msg_time = chrono::high_resolution_clock::now();
 	client->req_queue_lock.unlock();
 }
 
@@ -415,6 +421,7 @@ void send_pos_packet(int client, int mover)
 	if ((client == mover) || (0 != clients[client]->view_list.count(mover))) {
 		//clients[client]->view_list_lock.unlock();
 		send_packet(client, &packet);
+		//send_packet_deffer(client, &packet);
 	}
 	else {
 		//clients[client]->view_list_lock.unlock();
@@ -660,8 +667,8 @@ void do_worker(int thread_idx)
 	int tid = thread_idx;
 	while (true) {
 		//DWORD num_byte;
-		ULONGLONG key64;
-		PULONG_PTR p_key = &key64;
+		//ULONGLONG key64;
+		//PULONG_PTR p_key = &key64;
 		//WSAOVERLAPPED* p_over;
 
 		// 완료통지가 중요
@@ -669,9 +676,7 @@ void do_worker(int thread_idx)
 
 		// 완료통지 후 cq에 쌓인 result 처리
 		RIORESULT results[MAX_RIO_RESULTS];
-		//g_rio_cq_lock.lock();
 		ULONG numResults = gRIO.RIODequeueCompletion(g_rio_cq[tid], results, MAX_RIO_RESULTS);
-		//g_rio_cq_lock.unlock();
 
 		for (ULONG i = 0; i < numResults; ++i) {
 			RioIoContext* context = reinterpret_cast<RioIoContext*>(results[i].RequestContext);
@@ -754,8 +759,13 @@ void do_worker(int thread_idx)
 				while (true);
 			}
 
-			//if (clients[user_id]->storedmsgcnt > 5) {
+			//auto du = chrono::high_resolution_clock::now() - clients[user_id]->last_msg_time;
+			//if (chrono::duration_cast<chrono::milliseconds>(du).count() > 1) {
 			//	gRIO.RIOSend(clients[user_id]->req_queue, NULL, 0, RIO_MSG_COMMIT_ONLY, NULL);
+			//}
+
+			//if (clients[user_id]->storedmsgcnt > 5) {
+			//	clients[user_id]->storedmsgcnt = 0;
 			//	clients[user_id]->storedmsgcnt = 0;
 			//}
 		}
@@ -811,9 +821,9 @@ int main()
 	//rio_noti.Iocp.Overlapped = &iocp_over;
 	//rio_noti.Iocp.CompletionKey = NULL;
 	//g_rio_cq = gRIO.RIOCreateCompletionQueue(MAX_CQ_SIZE_PER_RIO_THREAD, &rio_noti);
-	for (int i = 0; i < MAX_THREAD; ++i)
+	for (int i = 0; i < MAX_THREAD; ++i) {
 		g_rio_cq[i] = gRIO.RIOCreateCompletionQueue(MAX_CQ_SIZE_PER_RIO_THREAD, 0);
-
+	}
 	for (int i = 0; i < MAX_USER; ++i) {
 		Enable_Clients.push(i);
 	}
