@@ -9,40 +9,21 @@
 #include <concurrent_unordered_set.h>
 #include <concurrent_queue.h>
 
-using namespace std;
-
 #include <WS2tcpip.h>
 #include <MSWSock.h>
 
 #include <immintrin.h>
+
+//#include "lfset.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
 //#include "..\..\SimpleIOCPServer\SimpleIOCPServer\protocol.h"
 #include "../RIO_Server/protocol.h"
+#include "ConstDefines.h"
 
-
-constexpr auto MAX_THREAD = 4;
-
-constexpr auto MAX_BUFFER = 128;
-constexpr auto VIEW_RANGE = 7;
-
-constexpr auto MAX_USER = 15000;
-
-constexpr int NUMPIECE = 2048;
-constexpr size_t BUFPIECESIZE = 128;
-constexpr int SESSION_BUFFER_SIZE = NUMPIECE * BUFPIECESIZE;
-constexpr int SEND_BUFFER_OFFSET = SESSION_BUFFER_SIZE / 2;
-
-constexpr auto MAX_RIO_RESULTS = 1024;
-constexpr auto MAX_SEND_RQ_SIZE_PER_SOCKET = 2048;
-constexpr auto MAX_RECV_RQ_SIZE_PER_SOCKET = 2048;
-constexpr auto CQ_SIZE_FACTOR = 5120;
-constexpr auto MAX_CQ_SIZE_PER_RIO_THREAD = (MAX_SEND_RQ_SIZE_PER_SOCKET + MAX_SEND_RQ_SIZE_PER_SOCKET) * CQ_SIZE_FACTOR;
-RIO_EXTENSION_FUNCTION_TABLE gRIO = { 0, };
-
-enum EVENT_TYPE { EV_RECV, EV_SEND, EV_MOVE, EV_PLAYER_MOVE_NOTIFY, EV_MOVE_TARGET, EV_ATTACK, EV_HEAL };
+using namespace std;
 
 class BufferPiece {
 public:
@@ -79,6 +60,50 @@ public:
 		//PieceinUse[idx] = false;
 	}
 };
+
+class CustomTX {
+public:
+	int abortcnt = 0;
+	bool isLocked = false;
+	mutex gLock;
+
+	void txStart(mutex& lock) 
+	{
+		while (true) {
+			while (isLocked);
+
+			if (abortcnt > MAX_ABORT_COUNT) {
+				cout << "1" << flush;
+				gLock.lock();
+				isLocked = true;
+				return;
+			}
+
+			unsigned stat = _xbegin();
+			if (_XBEGIN_STARTED == stat) {
+				if (isLocked)
+					_xabort(0xff);
+				return;
+			}
+			else 
+				abortcnt++;
+		}
+	}
+
+	void txEnd(mutex& lock) 
+	{
+		if (false == isLocked) {
+			_xend();
+		}
+		else {
+			gLock.unlock();
+			isLocked = false;
+		}
+	}
+};
+
+CustomTX gTX;
+
 
 // rio buffer 재사용
 struct COMPINFO2
@@ -183,19 +208,66 @@ public:
 	}
 };
 
+class CZone {
+public:
+	int ZoneIdx = -1;
+	unordered_set<int> NearZoneList;
+	unordered_set<int> Zone_Client_List;
+	mutex Zone_lock;
+
+	void SetNearZoneList() {
+		unordered_set<int> tmp;
+
+		int zonex = (ZoneIdx % ZONE_ONELINE_SIZE);
+		int zoney = ZoneIdx / ZONE_ONELINE_SIZE;
+		for (int j = -1; j < 2; ++j) {
+			for (int i = -1; i < 2; ++i) {
+				if ((zoney + i) < 0 || (zoney + i) >= ZONE_ONELINE_SIZE) continue;
+				if ((zonex + j) < 0 || (zonex + j) >= ZONE_ONELINE_SIZE) continue;
+
+				tmp.insert(ZoneIdx + j + (ZONE_ONELINE_SIZE * i));
+			}
+		}
+
+		for (auto i : tmp) {
+			if (i < 0 || i >= ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE) continue;
+
+			NearZoneList.insert(i);
+		}
+	}
+
+	void Insert(int id) {
+		Zone_lock.lock();
+		//gTX.txStart(Zone_lock);
+		Zone_Client_List.insert(id);
+		//gTX.txEnd(Zone_lock);
+		Zone_lock.unlock();
+	}
+
+	void Erase(int id) {
+		Zone_lock.lock();
+		//gTX.txStart(Zone_lock);
+		Zone_Client_List.erase(id);
+		//gTX.txEnd(Zone_lock);
+		Zone_lock.unlock();
+	}
+};
+
 //Rio_Memory_Manager* g_rio_mm;
 
 // 하나의 CQ로 모두 처리
 RIO_RQ thread_rio_rq[MAX_THREAD];
 RIO_CQ g_rio_cq[MAX_THREAD];
+//RIO_CQ g_rio_cq;
 mutex g_rio_cq_lock;
 
 //Concurrency::concurrent_unordered_map <int, SOCKETINFO*> clients;
 Concurrency::concurrent_queue<int> Enable_Clients;
 SOCKETINFO* clients[MAX_USER];
 
-Concurrency::concurrent_unordered_set<int> Zone[ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE];
-mutex Zone_lock[ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE];
+//unordered_set<int> Zone[ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE];
+//mutex Zone_lock[ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE];
+CZone Zone[ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE];
 //HANDLE	g_iocp;
 
 int new_user_id = 0;
@@ -221,11 +293,6 @@ int Get_Zone_idx(int id)
 	int curr_zone_x = cl->x / ZONE_WIDTH_SIZE;
 	int curr_zone_y = cl->y / ZONE_HEIGHT_SIZE;
 	return curr_zone_x + (curr_zone_y * ZONE_ONELINE_SIZE);
-}
-
-Concurrency::concurrent_unordered_set<int>& Get_Zone_Ref(int id)
-{
-	return Zone[Get_Zone_idx(id)];
 }
 
 bool Chk_Is_in_Zone(int clientid, int targetid)
@@ -459,9 +526,11 @@ void Disconnect(int id)
 	client->view_list.clear();
 	client->view_list_lock.unlock();
 
-	Zone_lock[clients[id]->curr_zone_idx].lock();
-	Zone[clients[id]->curr_zone_idx].unsafe_erase(id);
-	Zone_lock[clients[id]->curr_zone_idx].unlock();
+	int idx = clients[id]->curr_zone_idx;
+	Zone[idx].Erase(id);
+	//Zone_lock[clients[id]->curr_zone_idx].lock();
+	//Zone[clients[id]->curr_zone_idx].Zone_Client_List.erase(id);
+	//Zone_lock[clients[id]->curr_zone_idx].unlock();
 
 	for (auto& cl : clients) {
 		if (cl == nullptr) continue;
@@ -513,20 +582,23 @@ void test2(int id, concurrency::concurrent_unordered_set<int>& t, unordered_set<
 	}
 }
 
-void test(int id, concurrency::concurrent_unordered_set<int>& t) 
+void test(int id, concurrency::concurrent_unordered_set<int>& t)
 {
 	unordered_set <int> new_vl;
 	//auto& zone = Get_Zone_Ref(id);
-	auto& zone = Zone[Get_Zone_idx(id)];
-	for (auto& other_id : zone) {
-		auto& other = clients[other_id];
-		if (other == nullptr) continue;
-		if (id == other_id) continue;
-		if (false == clients[other_id]->is_connected) continue;
-		
-		if (true == is_near(id, other_id)) new_vl.insert(other_id);
-	}
+	int zoneidx = Get_Zone_idx(id);
+	
+	for (auto idx : Zone[zoneidx].NearZoneList) {
+		if (idx < 0 || idx >= ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE) continue;
+		for (auto& other_id : Zone[idx].Zone_Client_List) {
+			auto& other = clients[other_id];
+			if (other == nullptr) continue;
+			if (id == other_id) continue;
+			if (false == clients[other_id]->is_connected) continue;
 
+			if (true == is_near(id, other_id)) new_vl.insert(other_id);
+		}
+	}
 	test2(id, t, new_vl);
 }
 
@@ -534,11 +606,11 @@ void ProcessMove(int id, unsigned char dir)
 {
 	short x = clients[id]->x;
 	short y = clients[id]->y;
-	//clients[id]->view_list_lock.lock();
-	dolock(id);
+	clients[id]->view_list_lock.lock();
+	//dolock(id);
 	auto old_vl = clients[id]->view_list;
-	dounlock(id);
-	//clients[id]->view_list_lock.unlock();
+	//dounlock(id);
+	clients[id]->view_list_lock.unlock();
 	switch (dir) {
 	case D_UP: if (y > 0) y--;
 		break;
@@ -559,12 +631,15 @@ void ProcessMove(int id, unsigned char dir)
 	clients[id]->x = x;
 	clients[id]->y = y;
 
-	if (Get_Zone_idx(id) != clients[id]->curr_zone_idx) {
-		Zone[Get_Zone_idx(id)].insert(id);
+	int newzoneidx = Get_Zone_idx(id);
+	if (newzoneidx != clients[id]->curr_zone_idx) {
+		//Zone_lock[zoneidx].lock();
+		Zone[newzoneidx].Insert(id);
+		//Zone_lock[zoneidx].unlock();
 
-		Zone_lock[clients[id]->curr_zone_idx].lock();
-		Zone[clients[id]->curr_zone_idx].unsafe_erase(id);
-		Zone_lock[clients[id]->curr_zone_idx].unlock();
+		//Zone_lock[clients[id]->curr_zone_idx].lock();
+		Zone[clients[id]->curr_zone_idx].Erase(id);
+		//Zone_lock[clients[id]->curr_zone_idx].unlock();
 	}
 
 	test(id, old_vl);
@@ -599,6 +674,8 @@ void ProcessMove(int id, unsigned char dir)
 	//}
 }
 
+
+
 void ProcessLogin(int user_id, char* id_str)
 {
 	for (auto& cl : clients) {
@@ -614,19 +691,26 @@ void ProcessLogin(int user_id, char* id_str)
 	send_login_ok_packet(user_id);
 	clients[user_id]->is_connected = true;
 	clients[user_id]->curr_zone_idx = Get_Zone_idx(user_id);
-	Zone[clients[user_id]->curr_zone_idx].insert(user_id);
 
-	for (auto& cl : clients) {
-		if (cl == nullptr) continue;
-		int other_player = cl->id;
-		if (false == clients[other_player]->is_connected) continue;
-		
-		if (false == Chk_Is_in_Zone(user_id, other_player)) continue;
+	//Zone_lock[clients[user_id]->curr_zone_idx].lock();
+	Zone[clients[user_id]->curr_zone_idx].Insert(user_id);
+	//Zone_lock[clients[user_id]->curr_zone_idx].unlock();
 
-		if (true == is_near(other_player, user_id)) {
-			send_put_object_packet(other_player, user_id);
-			if (other_player != user_id) {
-				send_put_object_packet(user_id, other_player);
+	for (auto idx : Zone[clients[user_id]->curr_zone_idx].NearZoneList) {
+		if (idx < 0 || idx >= ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE) continue;
+		for (auto id : Zone[idx].Zone_Client_List) {
+			auto& cl = clients[id];
+			if (cl == nullptr) continue;
+			int other_player = cl->id;
+			if (false == clients[other_player]->is_connected) continue;
+
+			//if (false == Chk_Is_in_Zone(user_id, other_player)) continue;
+
+			if (true == is_near(other_player, user_id)) {
+				send_put_object_packet(other_player, user_id);
+				if (other_player != user_id) {
+					send_put_object_packet(user_id, other_player);
+				}
 			}
 		}
 	}
@@ -677,6 +761,9 @@ void do_worker(int thread_idx)
 		// 완료통지 후 cq에 쌓인 result 처리
 		RIORESULT results[MAX_RIO_RESULTS];
 		ULONG numResults = gRIO.RIODequeueCompletion(g_rio_cq[tid], results, MAX_RIO_RESULTS);
+		//g_rio_cq_lock.lock();
+		//ULONG numResults = gRIO.RIODequeueCompletion(g_rio_cq, results, MAX_RIO_RESULTS);
+		//g_rio_cq_lock.unlock();
 
 		for (ULONG i = 0; i < numResults; ++i) {
 			RioIoContext* context = reinterpret_cast<RioIoContext*>(results[i].RequestContext);
@@ -821,11 +908,17 @@ int main()
 	//rio_noti.Iocp.Overlapped = &iocp_over;
 	//rio_noti.Iocp.CompletionKey = NULL;
 	//g_rio_cq = gRIO.RIOCreateCompletionQueue(MAX_CQ_SIZE_PER_RIO_THREAD, &rio_noti);
+	//g_rio_cq = gRIO.RIOCreateCompletionQueue(MAX_CQ_SIZE_PER_RIO_THREAD, 0);
 	for (int i = 0; i < MAX_THREAD; ++i) {
 		g_rio_cq[i] = gRIO.RIOCreateCompletionQueue(MAX_CQ_SIZE_PER_RIO_THREAD, 0);
 	}
 	for (int i = 0; i < MAX_USER; ++i) {
 		Enable_Clients.push(i);
+	}
+
+	for (int i = 0; i < ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE; ++i) {
+		Zone[i].ZoneIdx = i;
+		Zone[i].SetNearZoneList();
 	}
 
 	//g_rio_mm = new Rio_Memory_Manager;
@@ -868,6 +961,7 @@ int main()
 			MAX_RECV_RQ_SIZE_PER_SOCKET, 1,
 			MAX_SEND_RQ_SIZE_PER_SOCKET, 1,
 			g_rio_cq[thread_idx], g_rio_cq[thread_idx],
+			//g_rio_cq, g_rio_cq,
 			(PVOID)static_cast<ULONGLONG>(user_id));
 
 		PostRecv(user_id);
