@@ -63,12 +63,13 @@ public:
 
 class CustomTX {
 public:
-	int abortcnt = 0;
+	//int abortcnt = 0;
 	bool isLocked = false;
 	mutex gLock;
 
 	void txStart(mutex& lock) 
 	{
+		int abortcnt = 0;
 		while (true) {
 			while (isLocked);
 
@@ -237,19 +238,19 @@ public:
 	}
 
 	void Insert(int id) {
-		Zone_lock.lock();
-		//gTX.txStart(Zone_lock);
+		//Zone_lock.lock();
+		gTX.txStart(Zone_lock);
 		Zone_Client_List.insert(id);
-		//gTX.txEnd(Zone_lock);
-		Zone_lock.unlock();
+		gTX.txEnd(Zone_lock);
+		//Zone_lock.unlock();
 	}
 
 	void Erase(int id) {
-		Zone_lock.lock();
-		//gTX.txStart(Zone_lock);
+		//Zone_lock.lock();
+		gTX.txStart(Zone_lock);
 		Zone_Client_List.erase(id);
-		//gTX.txEnd(Zone_lock);
-		Zone_lock.unlock();
+		gTX.txEnd(Zone_lock);
+		//Zone_lock.unlock();
 	}
 };
 
