@@ -12,11 +12,10 @@ using namespace chrono;
 static const int NUM_TEST = 4000000;
 static const int RANGE = 1000;
 static const int MAX_LEVEL = 10;
-
 class LFNODE {
 public:
 	int key;
-	unsigned next;
+	unsigned long long next;
 
 	LFNODE() {
 		next = 0;
@@ -28,40 +27,40 @@ public:
 	~LFNODE() {
 	}
 	LFNODE* GetNext() {
-		return reinterpret_cast<LFNODE*>(next & 0xFFFFFFFE);
+		return reinterpret_cast<LFNODE*>(next & -2LL);
 	}
 
 	void SetNext(LFNODE* ptr) {
-		next = reinterpret_cast<unsigned>(ptr);
+		next = reinterpret_cast<unsigned long long>(ptr);
 	}
 
 	LFNODE* GetNextWithMark(bool* mark) {
-		int temp = next;
+		unsigned long long temp = next;
 		*mark = (temp % 2) == 1;
-		return reinterpret_cast<LFNODE*>(temp & 0xFFFFFFFE);
+		return reinterpret_cast<LFNODE*>(temp & -2LL);
 	}
 
-	bool CAS(int old_value, int new_value)
+	bool CAS(unsigned long long old_value, unsigned long long new_value)
 	{
 		return atomic_compare_exchange_strong(
-			reinterpret_cast<atomic_int*>(&next),
+			reinterpret_cast<atomic_ullong*>(&next),
 			&old_value, new_value);
 	}
 
 	bool CAS(LFNODE* old_next, LFNODE* new_next, bool old_mark, bool new_mark) {
-		unsigned old_value = reinterpret_cast<unsigned>(old_next);
+		unsigned long long old_value = reinterpret_cast<unsigned long long>(old_next);
 		if (old_mark) old_value = old_value | 0x1;
-		else old_value = old_value & 0xFFFFFFFE;
-		unsigned new_value = reinterpret_cast<unsigned>(new_next);
+		else old_value = old_value & -2LL;
+		unsigned long long new_value = reinterpret_cast<unsigned long long>(new_next);
 		if (new_mark) new_value = new_value | 0x1;
-		else new_value = new_value & 0xFFFFFFFE;
+		else new_value = new_value & -2LL;
 		return CAS(old_value, new_value);
 	}
 
 	bool TryMark(LFNODE* ptr)
 	{
-		unsigned old_value = reinterpret_cast<unsigned>(ptr) & 0xFFFFFFFE;
-		unsigned new_value = old_value | 1;
+		unsigned long long old_value = reinterpret_cast<unsigned long long>(ptr) & -2LL;
+		unsigned long long new_value = old_value | 1;
 		return CAS(old_value, new_value);
 	}
 
