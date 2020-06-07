@@ -22,6 +22,7 @@
 //#include "..\..\SimpleIOCPServer\SimpleIOCPServer\protocol.h"
 #include "../RIO_Server/protocol.h"
 #include "ConstDefines.h"
+#include "lfset.h"
 
 using namespace std;
 
@@ -213,7 +214,8 @@ class CZone {
 public:
 	int ZoneIdx = -1;
 	unordered_set<int> NearZoneList;
-	unordered_set<int> Zone_Client_List;
+	//unordered_set<int> Zone_Client_List;
+	LFSET Zone_Client_List;
 	mutex Zone_lock;
 
 	void SetNearZoneList() {
@@ -239,17 +241,17 @@ public:
 
 	void Insert(int id) {
 		//Zone_lock.lock();
-		gTX.txStart(Zone_lock);
-		Zone_Client_List.insert(id);
-		gTX.txEnd(Zone_lock);
+		//gTX.txStart(Zone_lock);
+		Zone_Client_List.Add(id);
+		//gTX.txEnd(Zone_lock);
 		//Zone_lock.unlock();
 	}
 
 	void Erase(int id) {
 		//Zone_lock.lock();
-		gTX.txStart(Zone_lock);
-		Zone_Client_List.erase(id);
-		gTX.txEnd(Zone_lock);
+		//gTX.txStart(Zone_lock);
+		Zone_Client_List.Remove(id);
+		//gTX.txEnd(Zone_lock);
 		//Zone_lock.unlock();
 	}
 };
@@ -464,7 +466,7 @@ void send_put_object_packet(int client, int new_id)
 	send_packet(client, &packet);
 
 	if (client == new_id) return;
-	//lock_guard<mutex>lg{ clients[client]->view_list_lock };
+	lock_guard<mutex>lg{ clients[client]->view_list_lock };
 	clients[client]->view_list.insert(new_id);
 
 	//Get_Zone_Ref(client).insert(new_id);
@@ -480,19 +482,19 @@ void send_pos_packet(int client, int mover)
 	packet.y = clients[mover]->y;
 	packet.move_time = clients[client]->seq_no;
 
-	//clients[client]->view_list_lock.lock();
+	clients[client]->view_list_lock.lock();
 	//if ((client == mover) || (0 != Get_Zone_Ref(client).count(mover))) {
 	//	if (0 != clients[client]->view_list.count(mover)) {
 	//		send_packet(client, &packet);
 	//	}
 	//}
 	if ((client == mover) || (0 != clients[client]->view_list.count(mover))) {
-		//clients[client]->view_list_lock.unlock();
+		clients[client]->view_list_lock.unlock();
 		send_packet(client, &packet);
 		//send_packet_deffer(client, &packet);
 	}
 	else {
-		//clients[client]->view_list_lock.unlock();
+		clients[client]->view_list_lock.unlock();
 		send_put_object_packet(client, mover);
 	}
 }
@@ -551,17 +553,6 @@ void Disconnect(int id)
 	Enable_Clients.push(id);
 }
 
-int dolock(int id) {
-	clients[id]->view_list_lock.lock();
-	volatile int a = 0;
-	return a;
-}
-int dounlock(int id) {
-	clients[id]->view_list_lock.unlock();
-	volatile int a = 0;
-	return a;
-}
-
 void test2(int id, concurrency::concurrent_unordered_set<int>& t, unordered_set<int>& t2)
 {
 	send_pos_packet(id, id);
@@ -591,13 +582,28 @@ void test(int id, concurrency::concurrent_unordered_set<int>& t)
 	
 	for (auto idx : Zone[zoneidx].NearZoneList) {
 		if (idx < 0 || idx >= ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE) continue;
-		for (auto& other_id : Zone[idx].Zone_Client_List) {
-			auto& other = clients[other_id];
-			if (other == nullptr) continue;
-			if (id == other_id) continue;
-			if (false == clients[other_id]->is_connected) continue;
+		//for (auto& other_id : Zone[idx].Zone_Client_List) {
+		//	auto& other = clients[other_id];
+		//	if (other == nullptr) continue;
+		//	if (id == other_id) continue;
+		//	if (false == clients[other_id]->is_connected) continue;
+		//
+		//	if (true == is_near(id, other_id)) new_vl.insert(other_id);
+		//}
+		
+		LFNODE* curr = &Zone[idx].Zone_Client_List.head;
+		while (curr->GetNext() != &Zone[idx].Zone_Client_List.tail) {
+			curr = curr->GetNext();
+			if (false == curr->IsMarked()) {
+				int other_id = curr->key;
 
-			if (true == is_near(id, other_id)) new_vl.insert(other_id);
+				auto& other = clients[other_id];
+				if (other == nullptr) continue;
+				if (id == other_id) continue;
+				if (false == clients[other_id]->is_connected) continue;
+
+				if (true == is_near(id, other_id)) new_vl.insert(other_id);
+			}
 		}
 	}
 	test2(id, t, new_vl);
@@ -699,20 +705,44 @@ void ProcessLogin(int user_id, char* id_str)
 
 	for (auto idx : Zone[clients[user_id]->curr_zone_idx].NearZoneList) {
 		if (idx < 0 || idx >= ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE) continue;
-		for (auto id : Zone[idx].Zone_Client_List) {
-			auto& cl = clients[id];
-			if (cl == nullptr) continue;
-			int other_player = cl->id;
-			if (false == clients[other_player]->is_connected) continue;
+		//for (auto id : Zone[idx].Zone_Client_List) {
+		//	auto& cl = clients[id];
+		//	if (cl == nullptr) continue;
+		//	int other_player = cl->id;
+		//	if (false == clients[other_player]->is_connected) continue;
+		//
+		//	//if (false == Chk_Is_in_Zone(user_id, other_player)) continue;
+		//
+		//	if (true == is_near(other_player, user_id)) {
+		//		send_put_object_packet(other_player, user_id);
+		//		if (other_player != user_id) {
+		//			send_put_object_packet(user_id, other_player);
+		//		}
+		//	}
+		//}
 
-			//if (false == Chk_Is_in_Zone(user_id, other_player)) continue;
+		LFNODE* curr = &Zone[idx].Zone_Client_List.head;
+		while (curr->GetNext() != &Zone[idx].Zone_Client_List.tail) {
+			curr = curr->GetNext();
 
-			if (true == is_near(other_player, user_id)) {
-				send_put_object_packet(other_player, user_id);
-				if (other_player != user_id) {
-					send_put_object_packet(user_id, other_player);
+			if (false == curr->IsMarked()) {
+				int id = curr->key;
+
+				auto& cl = clients[id];
+				if (cl == nullptr) continue;
+				int other_player = cl->id;
+				if (false == clients[other_player]->is_connected) continue;
+
+				//if (false == Chk_Is_in_Zone(user_id, other_player)) continue;
+
+				if (true == is_near(other_player, user_id)) {
+					send_put_object_packet(other_player, user_id);
+					if (other_player != user_id) {
+						send_put_object_packet(user_id, other_player);
+					}
 				}
 			}
+
 		}
 	}
 }
