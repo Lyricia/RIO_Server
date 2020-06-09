@@ -1,7 +1,7 @@
 #include <iostream>
 #include <map>
 #include <thread>
-//#include <set>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <unordered_set>
@@ -14,8 +14,6 @@
 
 #include <immintrin.h>
 
-//#include "lfset.h"
-
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
@@ -23,6 +21,7 @@
 #include "../RIO_Server/protocol.h"
 #include "ConstDefines.h"
 #include "lfset.h"
+#include "lfqueue.h"
 
 using namespace std;
 
@@ -68,7 +67,7 @@ public:
 	bool isLocked = false;
 	mutex gLock;
 
-	void txStart(mutex& lock) 
+	void txStart(mutex& lock)
 	{
 		int abortcnt = 0;
 		while (true) {
@@ -87,12 +86,12 @@ public:
 					_xabort(0xff);
 				return;
 			}
-			else 
+			else
 				abortcnt++;
 		}
 	}
 
-	void txEnd(mutex& lock) 
+	void txEnd(mutex& lock)
 	{
 		if (false == isLocked) {
 			_xend();
@@ -113,6 +112,8 @@ struct COMPINFO2
 	EVENT_TYPE op;
 	RIO_BUF* rio_buffer;
 };
+
+
 
 struct SOCKETINFO
 {
@@ -142,8 +143,38 @@ struct SOCKETINFO
 	RIO_BUFFERID RioBufferId;
 	BufferManager RioBufferMng;
 
+	LFQUEUE MsgQueue;
 	atomic_int storedmsgcnt = 0;
 	chrono::steady_clock::time_point last_msg_time;
+
+	void PostDefferedMsg() {
+		if ((chrono::high_resolution_clock::now() - last_msg_time).count() < MIN_POST_TIME)
+			return;
+
+		int msgcnt = 0;
+
+		for (msgcnt = 0; msgcnt < MAX_POST_DEFFERED_MSG_COUNT; msgcnt++) {
+			if (MsgQueue.Empty()) 
+				break;
+
+			auto msg = MsgQueue.Deq();
+			if (!gRIO.RIOSend(req_queue, (PRIO_BUF)msg, 1, RIO_MSG_DEFER, msg))
+			{
+				printf_s("[DEBUG] RIO deffer Send error: %d\n", GetLastError());
+			}
+		}
+		if (msgcnt > 0) {
+			//cout << msgcnt << endl;;
+			CommitDefferedMSG();
+		}
+	}
+
+	void CommitDefferedMSG() {
+		if (!gRIO.RIOSend(req_queue, 0, 0, RIO_MSG_COMMIT_ONLY, 0))
+		{
+			printf_s("[DEBUG] RIO deffer Send commit error: %d\n", GetLastError());
+		}
+	}
 };
 
 // buffer 시작 주소
@@ -210,12 +241,18 @@ public:
 	}
 };
 
+struct msgWarpper {
+	int targetid = -1;
+	void* msgptr = nullptr;
+};
+
 class CZone {
 public:
 	int ZoneIdx = -1;
 	unordered_set<int> NearZoneList;
 	//unordered_set<int> Zone_Client_List;
 	LFSET Zone_Client_List;
+	LFQUEUE Zone_Msg_queue;
 	mutex Zone_lock;
 
 	void SetNearZoneList() {
@@ -253,6 +290,20 @@ public:
 		Zone_Client_List.Remove(id);
 		//gTX.txEnd(Zone_lock);
 		//Zone_lock.unlock();
+	}
+
+	void operator()() {}
+
+	template <class T>
+	void Iterate(std::function<T> f) {
+		LFNODE* curr = &Zone_Client_List.head;
+		while (curr->GetNext() != &Zone_Client_List.tail) {
+			curr = curr->GetNext();
+			if (false == curr->IsMarked()) {
+				if (-1 == f(curr->key))
+					continue;
+			}
+		}
 	}
 };
 
@@ -316,7 +367,6 @@ bool is_near(int a, int b)
 	return true;
 }
 
-#pragma optimize("", off)
 //void send_packet(int id, void* buff)
 //{
 //	char* packet = reinterpret_cast<char*>(buff);
@@ -344,9 +394,13 @@ bool is_near(int a, int b)
 //	gRIO.RIOSend(clients[id]->req_queue, comp_info->rio_buffer, 1, 0, comp_info);
 //	clients[id]->req_queue_lock.unlock();
 //}
+void send_packet_deffer(int id, void* buff);
 
 void send_packet(int id, void* buff)
 {
+	//send_packet_deffer(id, buff);
+	//return;
+
 	auto& client = clients[id];
 	unsigned char* p = reinterpret_cast<unsigned char*>(buff);
 	char* PiecePtr = nullptr;
@@ -380,6 +434,9 @@ void send_packet(int id, void* buff)
 void send_packet_deffer(int id, void* buff)
 {
 	auto& client = clients[id];
+
+	//Zone[client->curr_zone_idx].Zone_Msg_queue.Enq(buff);
+
 	unsigned char* p = reinterpret_cast<unsigned char*>(buff);
 	char* PiecePtr = nullptr;
 	int PieceIdx = -1;
@@ -397,17 +454,19 @@ void send_packet_deffer(int id, void* buff)
 	sendContext->Offset = SEND_BUFFER_OFFSET + PieceIdx * BUFPIECESIZE;
 	sendContext->SendBufIdx = PieceIdx;
 
-	DWORD sendbytes = 0;
-	DWORD flags = 0;
-
-	client->req_queue_lock.lock();
-	if (!gRIO.RIOSend(client->req_queue, (PRIO_BUF)sendContext, 1, RIO_MSG_DEFER, sendContext))
-	{
-		printf_s("[DEBUG] RIOSend error: %d\n", GetLastError());
-	}
-	//client->storedmsgcnt++;
+	client->MsgQueue.Enq(sendContext);
 	client->last_msg_time = chrono::high_resolution_clock::now();
-	client->req_queue_lock.unlock();
+
+	//DWORD sendbytes = 0;
+	//DWORD flags = 0;
+	//
+	//client->req_queue_lock.lock();
+	//if (!gRIO.RIOSend(client->req_queue, (PRIO_BUF)sendContext, 1, RIO_MSG_DEFER, sendContext))
+	//{
+	//	printf_s("[DEBUG] RIOSend error: %d\n", GetLastError());
+	//}
+	////client->storedmsgcnt++;
+	//client->req_queue_lock.unlock();
 }
 
 void PostRecv(int id)
@@ -430,7 +489,6 @@ void PostRecv(int id)
 	}
 	client->req_queue_lock.unlock();
 }
-#pragma optimize("", on)
 
 void send_login_ok_packet(int id)
 {
@@ -490,8 +548,8 @@ void send_pos_packet(int client, int mover)
 	//}
 	if ((client == mover) || (0 != clients[client]->view_list.count(mover))) {
 		clients[client]->view_list_lock.unlock();
-		send_packet(client, &packet);
-		//send_packet_deffer(client, &packet);
+		//send_packet(client, &packet);
+		send_packet_deffer(client, &packet);
 	}
 	else {
 		clients[client]->view_list_lock.unlock();
@@ -579,7 +637,7 @@ void test(int id, concurrency::concurrent_unordered_set<int>& t)
 	unordered_set <int> new_vl;
 	//auto& zone = Get_Zone_Ref(id);
 	int zoneidx = Get_Zone_idx(id);
-	
+
 	for (auto idx : Zone[zoneidx].NearZoneList) {
 		if (idx < 0 || idx >= ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE) continue;
 		//for (auto& other_id : Zone[idx].Zone_Client_List) {
@@ -590,7 +648,15 @@ void test(int id, concurrency::concurrent_unordered_set<int>& t)
 		//
 		//	if (true == is_near(id, other_id)) new_vl.insert(other_id);
 		//}
-		
+		//Zone[idx].Iterate(std::function<int(int)>([&](int other_id) {
+		//	auto& other = clients[other_id];
+		//	if (other == nullptr) return -1;
+		//	if (id == other_id) return -1;
+		//	if (false == clients[other_id]->is_connected) return -1;
+		//
+		//	if (true == is_near(id, other_id)) new_vl.insert(other_id);
+		//	}));
+
 		LFNODE* curr = &Zone[idx].Zone_Client_List.head;
 		while (curr->GetNext() != &Zone[idx].Zone_Client_List.tail) {
 			curr = curr->GetNext();
@@ -695,8 +761,8 @@ void ProcessLogin(int user_id, char* id_str)
 		}
 	}
 	strcpy_s(clients[user_id]->name, id_str);
-	send_login_ok_packet(user_id);
 	clients[user_id]->is_connected = true;
+	send_login_ok_packet(user_id);
 	clients[user_id]->curr_zone_idx = Get_Zone_idx(user_id);
 
 	//Zone_lock[clients[user_id]->curr_zone_idx].lock();
@@ -720,6 +786,31 @@ void ProcessLogin(int user_id, char* id_str)
 		//		}
 		//	}
 		//}
+
+		//Zone[idx].Iterate(std::function<int(int)>([&](int userid) {
+		//	auto& cl = clients[userid];
+		//	if (cl == nullptr) return -1;
+		//	int other_player = cl->id;
+		//	if (false == clients[other_player]->is_connected) return -1;
+		//
+		//	//if (false == Chk_Is_in_Zone(user_id, other_player)) continue;
+		//
+		//	if (true == is_near(other_player, user_id)) {
+		//		send_put_object_packet(other_player, user_id);
+		//		if (other_player != user_id) {
+		//			send_put_object_packet(user_id, other_player);
+		//		}
+		//	}
+		//	}));
+
+		/*LFNODE* curr = &Zone[i].Zone_Client_List.head;
+		while (curr->GetNext() != &Zone[i].Zone_Client_List.tail) {
+			curr = curr->GetNext();
+			if (false == curr->IsMarked()) {
+
+			}
+		*/
+
 
 		LFNODE* curr = &Zone[idx].Zone_Client_List.head;
 		while (curr->GetNext() != &Zone[idx].Zone_Client_List.tail) {
@@ -776,20 +867,26 @@ void ProcessPacket(int id, void* buff)
 	}
 }
 
-#pragma optimize("", off)
 void do_worker(int thread_idx)
 {
 	int tid = thread_idx;
 	while (true) {
-		//DWORD num_byte;
-		//ULONGLONG key64;
-		//PULONG_PTR p_key = &key64;
-		//WSAOVERLAPPED* p_over;
 
-		// 완료통지가 중요
-		//GetQueuedCompletionStatus(g_iocp, &num_byte, p_key, &p_over, INFINITE);
+		// Process Deffered Messages
+		for (int i = 0; i < ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE; ++i) {
+			if (tid != i % MAX_THREAD) continue;
 
-		// 완료통지 후 cq에 쌓인 result 처리
+			LFNODE* curr = &Zone[i].Zone_Client_List.head;
+			while (curr->GetNext() != &Zone[i].Zone_Client_List.tail) {
+				curr = curr->GetNext();
+				if (false == curr->IsMarked()) {
+					int userid = curr->key;
+					
+					clients[userid]->PostDefferedMsg();
+				}
+			}
+		}
+
 		RIORESULT results[MAX_RIO_RESULTS];
 		ULONG numResults = gRIO.RIODequeueCompletion(g_rio_cq[tid], results, MAX_RIO_RESULTS);
 		//g_rio_cq_lock.lock();
@@ -891,7 +988,6 @@ void do_worker(int thread_idx)
 		//gRIO.RIONotify(g_rio_cq);
 	}
 }
-#pragma optimize("", on)
 
 int main()
 {
@@ -980,6 +1076,8 @@ int main()
 		new_player->RioSendBufferPtr = new_player->RioBufferPointer + SEND_BUFFER_OFFSET;
 		new_player->RioBufferId = gRIO.RIORegisterBuffer(new_player->RioBufferPointer, SESSION_BUFFER_SIZE);
 		new_player->RioBufferMng.startPtr = new_player->RioSendBufferPtr;
+
+		new_player->last_msg_time = chrono::high_resolution_clock::now();
 
 		//new_player->recv_info.rio_buffer = g_rio_mm->new_rio_buffer();
 		//new_player->recv_info.op = EV_RECV;
