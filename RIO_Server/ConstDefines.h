@@ -19,6 +19,10 @@ constexpr auto MAX_CQ_SIZE_PER_RIO_THREAD = (MAX_SEND_RQ_SIZE_PER_SOCKET + MAX_S
 
 constexpr int MAX_ABORT_COUNT = 30;
 
+constexpr int MAX_POST_DEFFERED_MSG_COUNT = 10;
+constexpr int MIN_POST_TIME = 50;
+
+
 constexpr int ZONE_HEIGHT_SIZE = 20;
 constexpr int ZONE_WIDTH_SIZE = 20;
 constexpr int ZONE_ONELINE_SIZE = (WORLD_WIDTH / ZONE_WIDTH_SIZE);
