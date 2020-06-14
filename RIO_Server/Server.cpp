@@ -20,8 +20,10 @@
 //#include "..\..\SimpleIOCPServer\SimpleIOCPServer\protocol.h"
 #include "../RIO_Server/protocol.h"
 #include "ConstDefines.h"
-#include "lfset.h"
-#include "lfqueue.h"
+//#include "lfset.h"
+#include "lfset_EBR.h"
+//#include "lfqueue.h"
+#include "lfqueue_EBR.h"
 
 using namespace std;
 
@@ -143,7 +145,7 @@ struct SOCKETINFO
 	RIO_BUFFERID RioBufferId;
 	BufferManager RioBufferMng;
 
-	LFQUEUE MsgQueue;
+	LFQUEUE_epoch MsgQueue;
 	atomic_int storedmsgcnt = 0;
 	chrono::steady_clock::time_point last_msg_time;
 
@@ -158,6 +160,7 @@ struct SOCKETINFO
 				break;
 
 			auto msg = MsgQueue.Deq();
+			if (msg == nullptr) { break; }
 			if (!gRIO.RIOSend(req_queue, (PRIO_BUF)msg, 1, RIO_MSG_DEFER, msg))
 			{
 				printf_s("[DEBUG] RIO deffer Send error: %d\n", GetLastError());
@@ -251,8 +254,8 @@ public:
 	int ZoneIdx = -1;
 	unordered_set<int> NearZoneList;
 	//unordered_set<int> Zone_Client_List;
-	LFSET Zone_Client_List;
-	LFQUEUE Zone_Msg_queue;
+	LFSET_epoch Zone_Client_List;
+	LFQUEUE_epoch Zone_Msg_queue;
 	mutex Zone_lock;
 
 	void SetNearZoneList() {
@@ -398,8 +401,8 @@ void send_packet_deffer(int id, void* buff);
 
 void send_packet(int id, void* buff)
 {
-	//send_packet_deffer(id, buff);
-	//return;
+	send_packet_deffer(id, buff);
+	return;
 
 	auto& client = clients[id];
 	unsigned char* p = reinterpret_cast<unsigned char*>(buff);
@@ -869,7 +872,7 @@ void ProcessPacket(int id, void* buff)
 
 void do_worker(int thread_idx)
 {
-	int tid = thread_idx;
+	int tid = tl_idx = thread_idx;
 	while (true) {
 
 		// Process Deffered Messages
@@ -967,7 +970,7 @@ void do_worker(int thread_idx)
 				clients[user_id]->RioBufferMng.ReleaseUsedBufferPiece(context->SendBufIdx);
 
 				//g_rio_mm->delete_rio_buffer(comp_info->rio_buffer);
-				//delete comp_info;
+				delete context;
 			}
 			else {
 				cout << "Unknown Event Type :" << op << endl;
@@ -1023,8 +1026,9 @@ int main()
 	// Init IOCP
 	//g_iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, NULL, 0);
 	vector <thread> worker_threads;
-	for (int i = 0; i < MAX_THREAD; ++i)
+	for (int i = 0; i < MAX_THREAD; ++i) {
 		worker_threads.emplace_back(do_worker, i);
+	}
 
 	WSAOVERLAPPED iocp_over;
 	ZeroMemory(&iocp_over, sizeof(iocp_over));
