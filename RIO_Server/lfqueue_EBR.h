@@ -74,15 +74,15 @@ void q_end_op() {
 	q_reservation[tl_idx].store(ULLONG_MAX);
 }
 
-class LFQUEUE_epoch {
+class LFQUEUE {
 public:
 	EBRNODE* volatile head;
 	EBRNODE* volatile tail;
-	LFQUEUE_epoch()
+	LFQUEUE()
 	{
 		head = tail = new EBRNODE(0);
 	}
-	~LFQUEUE_epoch() {}
+	~LFQUEUE() {}
 
 	void Init()
 	{

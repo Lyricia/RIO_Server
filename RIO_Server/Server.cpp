@@ -17,12 +17,15 @@
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "mswsock.lib")
 
-//#include "..\..\SimpleIOCPServer\SimpleIOCPServer\protocol.h"
+#define DEFERRED true
+#define USETSX false
+
 #include "../RIO_Server/protocol.h"
 #include "ConstDefines.h"
+
 //#include "lfset.h"
-#include "lfset_EBR.h"
 //#include "lfqueue.h"
+#include "lfset_EBR.h"
 #include "lfqueue_EBR.h"
 
 using namespace std;
@@ -37,7 +40,15 @@ class BufferManager {
 public:
 	char* startPtr = nullptr;
 	BufferPiece PieceList[NUMPIECE]{};
+	concurrency::concurrent_queue<int> PieceIdx;
 	bool PieceinUse[NUMPIECE]{};
+
+	BufferManager() 
+	{
+		for (int i = 0; i < NUMPIECE; ++i) {
+			PieceIdx.push(i);
+		}
+	}
 
 	bool CAS(bool* addr, bool expected, bool new_val)
 	{
@@ -45,38 +56,47 @@ public:
 	}
 
 	int GetFreeBufferPieceIdx(char*& bufferptr) {
-		int i = 0;
-		while (true) {
-			if (CAS(&PieceinUse[i], false, true)) {
-				bufferptr = startPtr + i * BUFPIECESIZE;
-				return i;
-			}
-			i++;
-			if (i > NUMPIECE)
-				i = 0;
+		int idx = -1;
+		if (false == PieceIdx.try_pop(idx)) {
+			cout << "Out of Buffer piece\n" << flush;
 		}
+
+		bufferptr = startPtr + idx * BUFPIECESIZE;
+		return idx;
+
+		//int i = 0;
+		//while (true) {
+		//	if (CAS(&PieceinUse[i], false, true)) {
+		//		bufferptr = startPtr + i * BUFPIECESIZE;
+		//		return i;
+		//	}
+		//	i++;
+		//	if (i > NUMPIECE)
+		//		i = 0;
+		//}
 	}
 
 	void ReleaseUsedBufferPiece(int idx) {
-		while (CAS(&PieceinUse[idx], true, false)) {}
+		PieceIdx.push(idx);
+		//while (CAS(&PieceinUse[idx], true, false)) {}
 		//PieceinUse[idx] = false;
 	}
 };
 
 class CustomTX {
 public:
-	//int abortcnt = 0;
-	bool isLocked = false;
+	int abortcnt = 0;
+	volatile bool isLocked = false;
 	mutex gLock;
 
-	void txStart(mutex& lock)
+	void txStart()
 	{
 		int abortcnt = 0;
 		while (true) {
 			while (isLocked);
 
 			if (abortcnt > MAX_ABORT_COUNT) {
-				cout << "1" << flush;
+				//cout << "1" << flush;
 				gLock.lock();
 				isLocked = true;
 				return;
@@ -93,29 +113,23 @@ public:
 		}
 	}
 
-	void txEnd(mutex& lock)
+	void txEnd()
 	{
-		if (false == isLocked) {
-			_xend();
+		if (true == _xtest()) {
+			if (true == isLocked) {
+				_xabort(0xaa);
+			}
+			else _xend();
 		}
 		else {
 			gLock.unlock();
 			isLocked = false;
+			//cout << "'";
 		}
 	}
 };
 
 CustomTX gTX;
-
-
-// rio buffer 재사용
-struct COMPINFO2
-{
-	EVENT_TYPE op;
-	RIO_BUF* rio_buffer;
-};
-
-
 
 struct SOCKETINFO
 {
@@ -132,7 +146,7 @@ struct SOCKETINFO
 	int		seq_no;
 	int		curr_zone_idx = 0;
 
-	Concurrency::concurrent_unordered_set <int> view_list;
+	unordered_set <int> view_list;
 	mutex view_list_lock;		// 시야처리 lock
 
 	// client당 하나의 rq
@@ -145,17 +159,19 @@ struct SOCKETINFO
 	RIO_BUFFERID RioBufferId;
 	BufferManager RioBufferMng;
 
-	LFQUEUE_epoch MsgQueue;
+	concurrency::concurrent_queue<void*> q;
+
+	LFQUEUE MsgQueue;
 	atomic_int storedmsgcnt = 0;
 	chrono::steady_clock::time_point last_msg_time;
 
-	void PostDefferedMsg() {
+	void PostDeferredMsg() {
 		if ((chrono::high_resolution_clock::now() - last_msg_time).count() < MIN_POST_TIME)
 			return;
-
+		
 		int msgcnt = 0;
 
-		for (msgcnt = 0; msgcnt < MAX_POST_DEFFERED_MSG_COUNT; msgcnt++) {
+		for (msgcnt = 0; msgcnt < MAX_POST_DEFERRED_MSG_COUNT; msgcnt++) {
 			if (MsgQueue.Empty()) 
 				break;
 
@@ -163,20 +179,36 @@ struct SOCKETINFO
 			if (msg == nullptr) { break; }
 			if (!gRIO.RIOSend(req_queue, (PRIO_BUF)msg, 1, RIO_MSG_DEFER, msg))
 			{
-				printf_s("[DEBUG] RIO deffer Send error: %d\n", GetLastError());
+				printf_s("[DEBUG] RIO defer Send error: %d\n", GetLastError());
 			}
 		}
 		if (msgcnt > 0) {
 			//cout << msgcnt << endl;;
-			CommitDefferedMSG();
+			CommitDeferredMSG();
 		}
 	}
 
-	void CommitDefferedMSG() {
+	void CommitDeferredMSG() {
 		if (!gRIO.RIOSend(req_queue, 0, 0, RIO_MSG_COMMIT_ONLY, 0))
 		{
-			printf_s("[DEBUG] RIO deffer Send commit error: %d\n", GetLastError());
+			printf_s("[DEBUG] RIO defer Send commit error: %d\n", GetLastError());
 		}
+	}
+
+	void vl_lock() {
+#if USETSX
+		gTX.txStart();
+#else
+		view_list_lock.lock();
+#endif
+	}
+
+	void vl_unlock() {
+#if USETSX
+		gTX.txEnd();
+#else
+		view_list_lock.unlock();
+#endif
 	}
 };
 
@@ -192,71 +224,14 @@ struct RioIoContext : public RIO_BUF
 	int	SendBufIdx = -1;
 };
 
-class Rio_Memory_Manager
-{
-	//RIO_BUF* BuffSlot[MAX_USER * 100];
-	Concurrency::concurrent_queue <int>		av_buff_slot_q;
-	RIO_BUFFERID	rio_buff_id;
-public:
-	Rio_Memory_Manager()
-	{
-		DWORD buf_size = MAX_BUFFER * MAX_USER * 100;
-		g_rio_buf_addr = reinterpret_cast<char*>(VirtualAllocEx(GetCurrentProcess(), 0, buf_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-		rio_buff_id = gRIO.RIORegisterBuffer(g_rio_buf_addr, buf_size);
-		for (unsigned i = 0; i < buf_size / MAX_BUFFER; ++i) {
-			av_buff_slot_q.push(i);
-		}
-	}
-
-	//void* GetBuffPtr() { return BuffSlot; }
-
-	RIO_BUF* new_rio_buffer()
-	{
-		int slot_id;
-		if (false == av_buff_slot_q.try_pop(slot_id)) {
-			cout << "Out of RIO buffer slot\n";
-			DebugBreak();
-		}
-
-		RIO_BUF* buf = nullptr;
-		try {
-			buf = new RIO_BUF;
-		}
-		catch (bad_alloc ex)
-		{
-			cout << "new op failed\n";
-			cout << ex.what() << endl;
-			while (buf == nullptr) {
-				buf = new RIO_BUF;
-			}
-		}
-
-		buf->BufferId = rio_buff_id;
-		buf->Length = MAX_BUFFER;
-		buf->Offset = slot_id * MAX_BUFFER;
-		return buf;
-	}
-
-	void delete_rio_buffer(RIO_BUF* buf)
-	{
-		av_buff_slot_q.push(buf->Offset / MAX_BUFFER);
-		//delete buf;
-	}
-};
-
-struct msgWarpper {
-	int targetid = -1;
-	void* msgptr = nullptr;
-};
-
 class CZone {
 public:
 	int ZoneIdx = -1;
 	unordered_set<int> NearZoneList;
 	//unordered_set<int> Zone_Client_List;
-	LFSET_epoch Zone_Client_List;
-	LFQUEUE_epoch Zone_Msg_queue;
-	mutex Zone_lock;
+	LFSET Zone_Client_List;
+	//LFQUEUE Zone_Msg_queue;
+	//mutex Zone_lock;
 
 	void SetNearZoneList() {
 		unordered_set<int> tmp;
@@ -280,22 +255,12 @@ public:
 	}
 
 	void Insert(int id) {
-		//Zone_lock.lock();
-		//gTX.txStart(Zone_lock);
 		Zone_Client_List.Add(id);
-		//gTX.txEnd(Zone_lock);
-		//Zone_lock.unlock();
 	}
 
 	void Erase(int id) {
-		//Zone_lock.lock();
-		//gTX.txStart(Zone_lock);
 		Zone_Client_List.Remove(id);
-		//gTX.txEnd(Zone_lock);
-		//Zone_lock.unlock();
 	}
-
-	void operator()() {}
 
 	template <class T>
 	void Iterate(std::function<T> f) {
@@ -313,10 +278,9 @@ public:
 //Rio_Memory_Manager* g_rio_mm;
 
 // 하나의 CQ로 모두 처리
-RIO_RQ thread_rio_rq[MAX_THREAD];
 RIO_CQ g_rio_cq[MAX_THREAD];
 //RIO_CQ g_rio_cq;
-mutex g_rio_cq_lock;
+//mutex g_rio_cq_lock;
 
 //Concurrency::concurrent_unordered_map <int, SOCKETINFO*> clients;
 Concurrency::concurrent_queue<int> Enable_Clients;
@@ -397,13 +361,15 @@ bool is_near(int a, int b)
 //	gRIO.RIOSend(clients[id]->req_queue, comp_info->rio_buffer, 1, 0, comp_info);
 //	clients[id]->req_queue_lock.unlock();
 //}
-void send_packet_deffer(int id, void* buff);
+void send_packet_deferred(int id, void* buff);
 
 void send_packet(int id, void* buff)
 {
-	send_packet_deffer(id, buff);
+#if DEFERRED
+	send_packet_deferred(id, buff);
 	return;
 
+#else
 	auto& client = clients[id];
 	unsigned char* p = reinterpret_cast<unsigned char*>(buff);
 	char* PiecePtr = nullptr;
@@ -432,9 +398,11 @@ void send_packet(int id, void* buff)
 	}
 	//client->storedmsgcnt++;
 	client->req_queue_lock.unlock();
+#endif
+
 }
 
-void send_packet_deffer(int id, void* buff)
+void send_packet_deferred(int id, void* buff)
 {
 	auto& client = clients[id];
 
@@ -459,17 +427,6 @@ void send_packet_deffer(int id, void* buff)
 
 	client->MsgQueue.Enq(sendContext);
 	client->last_msg_time = chrono::high_resolution_clock::now();
-
-	//DWORD sendbytes = 0;
-	//DWORD flags = 0;
-	//
-	//client->req_queue_lock.lock();
-	//if (!gRIO.RIOSend(client->req_queue, (PRIO_BUF)sendContext, 1, RIO_MSG_DEFER, sendContext))
-	//{
-	//	printf_s("[DEBUG] RIOSend error: %d\n", GetLastError());
-	//}
-	////client->storedmsgcnt++;
-	//client->req_queue_lock.unlock();
 }
 
 void PostRecv(int id)
@@ -484,13 +441,17 @@ void PostRecv(int id)
 	DWORD recvbytes = 0;
 	DWORD flags = 0;
 
-	client->req_queue_lock.lock();
+	//client->req_queue_lock.lock();
 	/// start async recv
+#if DEFERRED
+#else
+	lock_guard<mutex>lg{ client->req_queue_lock };
+#endif
 	if (!gRIO.RIOReceive(client->req_queue, (PRIO_BUF)recvContext, 1, flags, recvContext))
 	{
 		printf_s("[DEBUG] RIOReceive error: %d\n", GetLastError());
 	}
-	client->req_queue_lock.unlock();
+	//client->req_queue_lock.unlock();
 }
 
 void send_login_ok_packet(int id)
@@ -527,8 +488,10 @@ void send_put_object_packet(int client, int new_id)
 	send_packet(client, &packet);
 
 	if (client == new_id) return;
-	lock_guard<mutex>lg{ clients[client]->view_list_lock };
+	//lock_guard<mutex>lg{ clients[client]->view_list_lock };
+	clients[client]->vl_lock();
 	clients[client]->view_list.insert(new_id);
+	clients[client]->vl_unlock();
 
 	//Get_Zone_Ref(client).insert(new_id);
 }
@@ -543,19 +506,23 @@ void send_pos_packet(int client, int mover)
 	packet.y = clients[mover]->y;
 	packet.move_time = clients[client]->seq_no;
 
-	clients[client]->view_list_lock.lock();
+	//clients[client]->view_list_lock.lock();
+
+	clients[client]->vl_lock();
 	//if ((client == mover) || (0 != Get_Zone_Ref(client).count(mover))) {
 	//	if (0 != clients[client]->view_list.count(mover)) {
 	//		send_packet(client, &packet);
 	//	}
 	//}
 	if ((client == mover) || (0 != clients[client]->view_list.count(mover))) {
-		clients[client]->view_list_lock.unlock();
-		//send_packet(client, &packet);
-		send_packet_deffer(client, &packet);
+		//clients[client]->view_list_lock.unlock();
+		clients[client]->vl_unlock();
+		send_packet(client, &packet);
+		//send_packet_deferred(client, &packet);
 	}
 	else {
-		clients[client]->view_list_lock.unlock();
+		//clients[client]->view_list_lock.unlock();
+		clients[client]->vl_unlock();
 		send_put_object_packet(client, mover);
 	}
 }
@@ -569,9 +536,12 @@ void send_remove_object_packet(int client, int leaver)
 	send_packet(client, &packet);
 
 	//lock_guard<mutex>lg{ clients[client]->view_list_lock };
-	clients[client]->view_list_lock.lock();
-	clients[client]->view_list.unsafe_erase(leaver);
-	clients[client]->view_list_lock.unlock();
+	//clients[client]->view_list_lock.lock();
+
+	clients[client]->vl_lock();
+	clients[client]->view_list.erase(leaver);
+	clients[client]->vl_unlock();
+	//clients[client]->view_list_lock.unlock();
 
 	//int zone_idx = Get_Zone_idx(client);
 	//Zone_lock[zone_idx]->lock();
@@ -585,10 +555,13 @@ void Disconnect(int id)
 	auto& client = clients[id];
 	closesocket(client->socket);
 	client->is_connected = false;
-	client->view_list_lock.lock();
+
+	//client->view_list_lock.lock();
+	client->vl_lock();
 	auto vl = client->view_list;
 	client->view_list.clear();
-	client->view_list_lock.unlock();
+	client->vl_unlock();
+	//client->view_list_lock.unlock();
 
 	int idx = clients[id]->curr_zone_idx;
 	Zone[idx].Erase(id);
@@ -596,25 +569,53 @@ void Disconnect(int id)
 	//Zone[clients[id]->curr_zone_idx].Zone_Client_List.erase(id);
 	//Zone_lock[clients[id]->curr_zone_idx].unlock();
 
-	for (auto& cl : clients) {
-		if (cl == nullptr) continue;
-		if (cl->id == id) continue;
-		if (false == cl->is_connected) continue;
-		//if (false == zone.count(id)) continue;
+	for (auto& z : Zone[idx].NearZoneList) {
 
-		if (false == cl->view_list.count(id)) continue;
+		LFNODE* curr = &Zone[z].Zone_Client_List.head;
+		while (curr->GetNext() != &Zone[z].Zone_Client_List.tail) {
+			curr = curr->GetNext();
+			if (false == curr->IsMarked()) {
+				auto& cl = clients[curr->key];
+				if (cl == nullptr) continue;
+				if (cl->id == id) continue;
+				if (false == cl->is_connected) continue;
+				//if (false == zone.count(id)) continue;
 
-		cl->view_list_lock.lock();
-		cl->view_list.unsafe_erase(id);
-		cl->view_list_lock.unlock();
+				if (false == cl->view_list.count(id)) continue;
 
-		send_remove_object_packet(cl->id, id);
+
+				//cl->view_list_lock.lock();
+				cl->vl_lock();
+				cl->view_list.erase(id);
+				cl->vl_unlock();
+				//cl->view_list_lock.unlock();
+
+				send_remove_object_packet(cl->id, id);
+			}
+		}
 	}
+
+	//for (auto& cl : clients) {
+	//	if (cl == nullptr) continue;
+	//	if (cl->id == id) continue;
+	//	if (false == cl->is_connected) continue;
+	//	//if (false == zone.count(id)) continue;
+	//
+	//	if (false == cl->view_list.count(id)) continue;
+	//
+	//	gTX.txStart();
+	//	//cl->view_list_lock.lock();
+	//	cl->view_list.unsafe_erase(id);
+	//	gTX.txEnd();
+	//	//cl->view_list_lock.unlock();
+	//
+	//	send_remove_object_packet(cl->id, id);
+	//}
 
 	Enable_Clients.push(id);
 }
 
-void test2(int id, concurrency::concurrent_unordered_set<int>& t, unordered_set<int>& t2)
+void test2(int id, unordered_set<int>& t, unordered_set<int>& t2)
 {
 	send_pos_packet(id, id);
 	for (auto cl : t) {
@@ -635,7 +636,7 @@ void test2(int id, concurrency::concurrent_unordered_set<int>& t, unordered_set<
 	}
 }
 
-void test(int id, concurrency::concurrent_unordered_set<int>& t)
+void test(int id, unordered_set<int>& t)
 {
 	unordered_set <int> new_vl;
 	//auto& zone = Get_Zone_Ref(id);
@@ -682,11 +683,13 @@ void ProcessMove(int id, unsigned char dir)
 {
 	short x = clients[id]->x;
 	short y = clients[id]->y;
-	clients[id]->view_list_lock.lock();
-	//dolock(id);
+
+	//clients[id]->view_list_lock.lock();
+	clients[id]->vl_lock();
 	auto old_vl = clients[id]->view_list;
-	//dounlock(id);
-	clients[id]->view_list_lock.unlock();
+	clients[id]->vl_unlock();
+	//gTX.txEnd();
+	//clients[id]->view_list_lock.unlock();
 	switch (dir) {
 	case D_UP: if (y > 0) y--;
 		break;
@@ -870,31 +873,38 @@ void ProcessPacket(int id, void* buff)
 	}
 }
 
+void test111(RIORESULT* r, int numResults) {
+	for (int i = 0; i < ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE; ++i) {
+		if (tl_idx != i % MAX_THREAD) continue;
+
+		LFNODE* curr = &Zone[i].Zone_Client_List.head;
+		while (curr->GetNext() != &Zone[i].Zone_Client_List.tail) {
+			curr = curr->GetNext();
+			if (false == curr->IsMarked()) {
+				int userid = curr->key;
+
+				clients[userid]->PostDeferredMsg();
+			}
+		}
+	}
+}
+
 void do_worker(int thread_idx)
 {
 	int tid = tl_idx = thread_idx;
 	while (true) {
 
-		// Process Deffered Messages
-		for (int i = 0; i < ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE; ++i) {
-			if (tid != i % MAX_THREAD) continue;
-
-			LFNODE* curr = &Zone[i].Zone_Client_List.head;
-			while (curr->GetNext() != &Zone[i].Zone_Client_List.tail) {
-				curr = curr->GetNext();
-				if (false == curr->IsMarked()) {
-					int userid = curr->key;
-					
-					clients[userid]->PostDefferedMsg();
-				}
-			}
-		}
+#if DEFERRED
+		// Process Deferred Messages
+#endif
 
 		RIORESULT results[MAX_RIO_RESULTS];
 		ULONG numResults = gRIO.RIODequeueCompletion(g_rio_cq[tid], results, MAX_RIO_RESULTS);
 		//g_rio_cq_lock.lock();
 		//ULONG numResults = gRIO.RIODequeueCompletion(g_rio_cq, results, MAX_RIO_RESULTS);
 		//g_rio_cq_lock.unlock();
+
+		test111(results, numResults);
 
 		for (ULONG i = 0; i < numResults; ++i) {
 			RioIoContext* context = reinterpret_cast<RioIoContext*>(results[i].RequestContext);
@@ -916,6 +926,7 @@ void do_worker(int thread_idx)
 				//g_rio_mm->delete_rio_buffer(clients[user_id]->recv_info.rio_buffer);
 
 				if (op == EV_SEND) {
+					clients[user_id]->RioBufferMng.ReleaseUsedBufferPiece(context->SendBufIdx);
 					// Send buf해제
 					//g_rio_mm->delete_rio_buffer(comp_info->rio_buffer);
 					//delete comp_info;
@@ -1045,6 +1056,11 @@ int main()
 	}
 	for (int i = 0; i < MAX_USER; ++i) {
 		Enable_Clients.push(i);
+		clients[i] = new SOCKETINFO;
+		clients[i]->RioBufferPointer = reinterpret_cast<char*>(VirtualAllocEx(GetCurrentProcess(), 0, SESSION_BUFFER_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+		clients[i]->RioSendBufferPtr = clients[i]->RioBufferPointer + SEND_BUFFER_OFFSET;
+		clients[i]->RioBufferId = gRIO.RIORegisterBuffer(clients[i]->RioBufferPointer, SESSION_BUFFER_SIZE);
+		clients[i]->RioBufferMng.startPtr = clients[i]->RioSendBufferPtr;
 	}
 
 	for (int i = 0; i < ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE; ++i) {
@@ -1054,6 +1070,7 @@ int main()
 
 	//g_rio_mm = new Rio_Memory_Manager;
 
+	int prev = -1;
 	while (true) {
 		SOCKET clientSocket = accept(listenSocket, (struct sockaddr*)&clientAddr, &addrLen);
 		if (INVALID_SOCKET == clientSocket) {
@@ -1068,8 +1085,16 @@ int main()
 			cout << "Currently Max User\n";
 			continue;
 		}
+		if (prev == user_id) {
+			cout << "aawefawefawef" << flush;
+			while (true);
+		}
 
-		SOCKETINFO* new_player = new SOCKETINFO;
+		prev = user_id;
+
+
+
+		SOCKETINFO* new_player = clients[user_id];
 		new_player->id = user_id;
 		new_player->socket = clientSocket;
 		new_player->prev_packet_size = 0;

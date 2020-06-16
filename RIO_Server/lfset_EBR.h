@@ -69,7 +69,7 @@ public:
 atomic_ullong set_g_epoch = 0;
 atomic_ullong set_reservation[MAX_THREAD]{ ULLONG_MAX };
 thread_local unsigned long long set_local_counter = 0;
-thread_local std::list<LFNODE*> set_retired_list;
+thread_local std::vector<LFNODE*> set_retired_list;
 
 
 void set_empty() {
@@ -101,7 +101,7 @@ void set_epoch_clear() {
 }
 
 void set_retire(LFNODE* block) {
-	set_retired_list.push_back(block);
+	set_retired_list.emplace_back(block);
 	block->retire_epoch = set_g_epoch;
 	set_local_counter++;
 
@@ -122,11 +122,11 @@ void set_end_op() {
 	set_reservation[tl_idx].store(ULLONG_MAX);
 }
 
-class LFSET_epoch
+class LFSET
 {
 public:
 	LFNODE head, tail;
-	LFSET_epoch()
+	LFSET()
 	{
 		head.key = 0x80000000;
 		tail.key = 0x7FFFFFFF;

@@ -4,7 +4,7 @@ constexpr auto MAX_THREAD = 4;
 constexpr auto MAX_BUFFER = 128;
 constexpr auto VIEW_RANGE = 7;
 
-constexpr auto MAX_USER = 15000;
+constexpr auto MAX_USER = 10000;
 
 constexpr int NUMPIECE = 2048;
 constexpr size_t BUFPIECESIZE = 128;
@@ -19,8 +19,8 @@ constexpr auto MAX_CQ_SIZE_PER_RIO_THREAD = (MAX_SEND_RQ_SIZE_PER_SOCKET + MAX_S
 
 constexpr int MAX_ABORT_COUNT = 30;
 
-constexpr int MAX_POST_DEFFERED_MSG_COUNT = 10;
-constexpr int MIN_POST_TIME = 80;
+constexpr int MAX_POST_DEFERRED_MSG_COUNT = 20;
+constexpr int MIN_POST_TIME = 10;
 
 
 constexpr int ZONE_HEIGHT_SIZE = 20;
