@@ -1,15 +1,15 @@
 #pragma once
-constexpr auto MAX_THREAD = 4;
+constexpr auto MAX_THREAD = 1;
 
 constexpr auto MAX_BUFFER = 128;
 constexpr auto VIEW_RANGE = 7;
 
 constexpr auto MAX_USER = 10000;
 
-constexpr int NUMPIECE = 2048;
-constexpr size_t BUFPIECESIZE = 128;
+constexpr int NUMPIECE = 1024;
+constexpr size_t BUFPIECESIZE = 32;
 constexpr int SESSION_BUFFER_SIZE = NUMPIECE * BUFPIECESIZE;
-constexpr int SEND_BUFFER_OFFSET = SESSION_BUFFER_SIZE / 2;
+constexpr int SEND_BUFFER_OFFSET = 256;
 
 constexpr auto MAX_RIO_RESULTS = 1024;
 constexpr auto MAX_SEND_RQ_SIZE_PER_SOCKET = 2048;
@@ -19,7 +19,7 @@ constexpr auto MAX_CQ_SIZE_PER_RIO_THREAD = (MAX_SEND_RQ_SIZE_PER_SOCKET + MAX_S
 
 constexpr int MAX_ABORT_COUNT = 30;
 
-constexpr int MAX_POST_DEFERRED_MSG_COUNT = 20;
+constexpr int MAX_POST_DEFERRED_MSG_COUNT = 50;
 constexpr int MIN_POST_TIME = 10;
 
 

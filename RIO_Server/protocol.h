@@ -1,6 +1,6 @@
 #pragma once
 
-constexpr int MAX_ID_LEN = 50;
+constexpr int MAX_ID_LEN = 20;
 constexpr int MAX_STR_LEN = 255;
 
 #define WORLD_WIDTH		400
@@ -71,7 +71,7 @@ struct sc_packet_chat {
 	char size;
 	char type;
 	int	 id;
-	char chat[100];
+	char chat[10];
 };
 
 struct sc_packet_stat_change {
@@ -108,7 +108,7 @@ struct cs_packet_attack {
 struct cs_packet_chat {
 	char	size;
 	char	type;
-	char	chat_str[100];
+	char	chat_str[10];
 };
 
 struct cs_packet_logout {

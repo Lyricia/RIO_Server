@@ -18,7 +18,7 @@
 #pragma comment(lib, "mswsock.lib")
 
 #define DEFERRED true
-#define USETSX false
+#define USETSX true
 
 #include "../RIO_Server/protocol.h"
 #include "ConstDefines.h"
@@ -43,7 +43,7 @@ public:
 	concurrency::concurrent_queue<int> PieceIdx;
 	bool PieceinUse[NUMPIECE]{};
 
-	BufferManager() 
+	BufferManager()
 	{
 		for (int i = 0; i < NUMPIECE; ++i) {
 			PieceIdx.push(i);
@@ -89,7 +89,7 @@ public:
 	volatile bool isLocked = false;
 	mutex gLock;
 
-	void txStart()
+	void txStart(mutex& lock)
 	{
 		int abortcnt = 0;
 		while (true) {
@@ -97,8 +97,8 @@ public:
 
 			if (abortcnt > MAX_ABORT_COUNT) {
 				//cout << "1" << flush;
-				gLock.lock();
 				isLocked = true;
+				lock.lock();
 				return;
 			}
 
@@ -113,7 +113,7 @@ public:
 		}
 	}
 
-	void txEnd()
+	void txEnd(mutex& lock)
 	{
 		if (true == _xtest()) {
 			if (true == isLocked) {
@@ -122,7 +122,7 @@ public:
 			else _xend();
 		}
 		else {
-			gLock.unlock();
+			lock.unlock();
 			isLocked = false;
 			//cout << "'";
 		}
@@ -137,11 +137,11 @@ struct SOCKETINFO
 	int		id;
 
 	// packet 재조립
-	char	pre_net_buf[MAX_BUFFER];
+	char	pre_net_buf[MAX_BUFFER]{};
 	int		prev_packet_size;
-	atomic_bool	is_connected;
+	atomic_bool	is_connected = false;
 
-	char	name[MAX_ID_LEN];
+	char	name[MAX_ID_LEN]{};
 	short	x, y;
 	int		seq_no;
 	int		curr_zone_idx = 0;
@@ -157,7 +157,8 @@ struct SOCKETINFO
 	char* RioBufferPointer;
 	char* RioSendBufferPtr;
 	RIO_BUFFERID RioBufferId;
-	BufferManager RioBufferMng;
+	BufferManager RioBufferMng;		// memory
+
 
 	concurrency::concurrent_queue<void*> q;
 
@@ -166,13 +167,14 @@ struct SOCKETINFO
 	chrono::steady_clock::time_point last_msg_time;
 
 	void PostDeferredMsg() {
-		if ((chrono::high_resolution_clock::now() - last_msg_time).count() < MIN_POST_TIME)
-			return;
-		
+		//if ((chrono::high_resolution_clock::now() - last_msg_time).count() < MIN_POST_TIME)
+		//	return;
+
 		int msgcnt = 0;
 
 		for (msgcnt = 0; msgcnt < MAX_POST_DEFERRED_MSG_COUNT; msgcnt++) {
-			if (MsgQueue.Empty()) 
+			//while (true) {
+			if (MsgQueue.Empty())
 				break;
 
 			auto msg = MsgQueue.Deq();
@@ -182,10 +184,15 @@ struct SOCKETINFO
 				printf_s("[DEBUG] RIO defer Send error: %d\n", GetLastError());
 			}
 		}
+
+
 		if (msgcnt > 0) {
-			//cout << msgcnt << endl;;
 			CommitDeferredMSG();
 		}
+
+		//if (msgcnt > 25) {
+		//	cout << msgcnt << endl;;
+		//}
 	}
 
 	void CommitDeferredMSG() {
@@ -197,7 +204,7 @@ struct SOCKETINFO
 
 	void vl_lock() {
 #if USETSX
-		gTX.txStart();
+		gTX.txStart(view_list_lock);
 #else
 		view_list_lock.lock();
 #endif
@@ -205,7 +212,7 @@ struct SOCKETINFO
 
 	void vl_unlock() {
 #if USETSX
-		gTX.txEnd();
+		gTX.txEnd(view_list_lock);
 #else
 		view_list_lock.unlock();
 #endif
@@ -426,19 +433,20 @@ void send_packet_deferred(int id, void* buff)
 	sendContext->SendBufIdx = PieceIdx;
 
 	client->MsgQueue.Enq(sendContext);
-	client->last_msg_time = chrono::high_resolution_clock::now();
+	//client->last_msg_time = chrono::high_resolution_clock::now();
 }
 
-void PostRecv(int id)
+void PostRecv(RioIoContext* recvContext)
 {
-	auto& client = clients[id];
-	RioIoContext* recvContext = new RioIoContext(client, EVENT_TYPE::EV_RECV);
+	//auto& client = clients[id];
+	//RioIoContext* recvContext = new RioIoContext(client, EVENT_TYPE::EV_RECV);
 
-	recvContext->BufferId = client->RioBufferId;
-	recvContext->Length = SESSION_BUFFER_SIZE / 2;
-	recvContext->Offset = 0;
+	//recvContext->BufferId = client->RioBufferId;
+	//recvContext->Length = SEND_BUFFER_OFFSET;
+	//recvContext->Offset = 0;
 
-	DWORD recvbytes = 0;
+	auto client = recvContext->clientSession;
+
 	DWORD flags = 0;
 
 	//client->req_queue_lock.lock();
@@ -449,7 +457,7 @@ void PostRecv(int id)
 #endif
 	if (!gRIO.RIOReceive(client->req_queue, (PRIO_BUF)recvContext, 1, flags, recvContext))
 	{
-		printf_s("[DEBUG] RIOReceive error: %d\n", GetLastError());
+		printf_s("[DEBUG] %d RIOReceive error: %d\n", client->id, GetLastError());
 	}
 	//client->req_queue_lock.unlock();
 }
@@ -569,31 +577,48 @@ void Disconnect(int id)
 	//Zone[clients[id]->curr_zone_idx].Zone_Client_List.erase(id);
 	//Zone_lock[clients[id]->curr_zone_idx].unlock();
 
-	for (auto& z : Zone[idx].NearZoneList) {
+	for (auto idx : vl) {
+		auto& cl = clients[idx];
 
-		LFNODE* curr = &Zone[z].Zone_Client_List.head;
-		while (curr->GetNext() != &Zone[z].Zone_Client_List.tail) {
-			curr = curr->GetNext();
-			if (false == curr->IsMarked()) {
-				auto& cl = clients[curr->key];
-				if (cl == nullptr) continue;
-				if (cl->id == id) continue;
-				if (false == cl->is_connected) continue;
-				//if (false == zone.count(id)) continue;
+		if (cl == nullptr) continue;
+		if (cl->id == id) continue;
+		if (false == cl->is_connected) continue;
+		//if (false == zone.count(id)) continue;
+		if (false == cl->view_list.count(id)) continue;
 
-				if (false == cl->view_list.count(id)) continue;
+		cl->vl_lock();
+		cl->view_list.erase(id);
+		cl->vl_unlock();
 
-
-				//cl->view_list_lock.lock();
-				cl->vl_lock();
-				cl->view_list.erase(id);
-				cl->vl_unlock();
-				//cl->view_list_lock.unlock();
-
-				send_remove_object_packet(cl->id, id);
-			}
-		}
+		send_remove_object_packet(cl->id, id);
 	}
+
+
+	//for (auto& z : Zone[idx].NearZoneList) {
+	//	LFNODE* curr = &Zone[z].Zone_Client_List.head;
+	//	while (curr->GetNext() != &Zone[z].Zone_Client_List.tail) {
+	//		curr = curr->GetNext();
+	//		if (false == curr->IsMarked()) {
+	//			auto& cl = clients[curr->key];
+	//			
+	//			if (cl == nullptr) continue;
+	//			if (cl->id == id) continue;
+	//			if (false == cl->is_connected) continue;
+	//			//if (false == zone.count(id)) continue;
+	//
+	//			if (false == cl->view_list.count(id)) continue;
+	//
+	//
+	//			//cl->view_list_lock.lock();
+	//			cl->vl_lock();
+	//			cl->view_list.erase(id);
+	//			cl->vl_unlock();
+	//			//cl->view_list_lock.unlock();
+	//
+	//			send_remove_object_packet(cl->id, id);
+	//		}
+	//	}
+	//}
 
 	//for (auto& cl : clients) {
 	//	if (cl == nullptr) continue;
@@ -757,15 +782,15 @@ void ProcessMove(int id, unsigned char dir)
 
 void ProcessLogin(int user_id, char* id_str)
 {
-	for (auto& cl : clients) {
-		if (cl == nullptr) continue;
-		if (false == cl->is_connected) continue;
-		if (0 == strcmp(cl->name, id_str)) {
-			send_login_fail(user_id);
-			Disconnect(user_id);
-			return;
-		}
-	}
+	//for (auto& cl : clients) {
+	//	if (cl == nullptr) continue;
+	//	if (false == cl->is_connected) continue;
+	//	if (0 != strcmp(cl->name, id_str)) {
+	//		send_login_fail(user_id);
+	//		Disconnect(user_id);
+	//		return;
+	//	}
+	//}
 	strcpy_s(clients[user_id]->name, id_str);
 	clients[user_id]->is_connected = true;
 	send_login_ok_packet(user_id);
@@ -873,7 +898,7 @@ void ProcessPacket(int id, void* buff)
 	}
 }
 
-void test111(RIORESULT* r, int numResults) {
+void test111() {
 	for (int i = 0; i < ZONE_ONELINE_SIZE * ZONE_ONELINE_SIZE; ++i) {
 		if (tl_idx != i % MAX_THREAD) continue;
 
@@ -896,6 +921,7 @@ void do_worker(int thread_idx)
 
 #if DEFERRED
 		// Process Deferred Messages
+		test111();
 #endif
 
 		RIORESULT results[MAX_RIO_RESULTS];
@@ -904,7 +930,6 @@ void do_worker(int thread_idx)
 		//ULONG numResults = gRIO.RIODequeueCompletion(g_rio_cq, results, MAX_RIO_RESULTS);
 		//g_rio_cq_lock.unlock();
 
-		test111(results, numResults);
 
 		for (ULONG i = 0; i < numResults; ++i) {
 			RioIoContext* context = reinterpret_cast<RioIoContext*>(results[i].RequestContext);
@@ -913,6 +938,7 @@ void do_worker(int thread_idx)
 			EVENT_TYPE op = context->IoType;
 			ULONG num_byte = results[i].BytesTransferred;
 			int user_id = static_cast<int>(results[i].SocketContext);
+
 
 			if (0 == num_byte) {
 				if (false == clients[user_id]->is_connected)
@@ -971,7 +997,8 @@ void do_worker(int thread_idx)
 				clients[user_id]->prev_packet_size = prev_packet_size;
 
 				// 다시 Recv
-				PostRecv(user_id);
+				//PostRecv(user_id);
+				PostRecv(context);
 				//gRIO.RIOReceive(clients[user_id]->req_queue, clients[user_id]->recv_info.rio_buffer, 1, 0, &clients[user_id]->recv_info);
 
 				/// 여기서 notify를 하면 recv의 순서가 엇갈린다
@@ -997,6 +1024,11 @@ void do_worker(int thread_idx)
 			//	clients[user_id]->storedmsgcnt = 0;
 			//	clients[user_id]->storedmsgcnt = 0;
 			//}
+
+#if DEFERRED
+			//clients[user_id]->PostDeferredMsg();
+#endif
+
 		}
 		// 전체가 끝났으니 여기서 다시 완료통지 (PGCS)
 		//gRIO.RIONotify(g_rio_cq);
@@ -1092,8 +1124,6 @@ int main()
 
 		prev = user_id;
 
-
-
 		SOCKETINFO* new_player = clients[user_id];
 		new_player->id = user_id;
 		new_player->socket = clientSocket;
@@ -1106,7 +1136,7 @@ int main()
 		new_player->RioBufferId = gRIO.RIORegisterBuffer(new_player->RioBufferPointer, SESSION_BUFFER_SIZE);
 		new_player->RioBufferMng.startPtr = new_player->RioSendBufferPtr;
 
-		new_player->last_msg_time = chrono::high_resolution_clock::now();
+		//new_player->last_msg_time = chrono::high_resolution_clock::now();
 
 		//new_player->recv_info.rio_buffer = g_rio_mm->new_rio_buffer();
 		//new_player->recv_info.op = EV_RECV;
@@ -1122,7 +1152,12 @@ int main()
 			//g_rio_cq, g_rio_cq,
 			(PVOID)static_cast<ULONGLONG>(user_id));
 
-		PostRecv(user_id);
+		RioIoContext* recvContext = new RioIoContext(new_player, EVENT_TYPE::EV_RECV);
+		recvContext->BufferId = new_player->RioBufferId;
+		recvContext->Length = SEND_BUFFER_OFFSET;
+		recvContext->Offset = 0;
+
+		PostRecv(recvContext);
 		//gRIO.RIOReceive(new_player->req_queue, new_player->recv_info.rio_buffer, 1, NULL, &new_player->recv_info);
 		//gRIO.RIONotify(g_rio_cq[thread_idx]);
 	}
